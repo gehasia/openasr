@@ -303,8 +303,14 @@ fn split_segment_at_turn_boundaries(
 }
 
 /// Byte offset in `text` where each word starts, located sequentially.
-/// `None` when any word cannot be found in order (defensive: words are derived
-/// from the text by the decoders, so this only trips on a contract drift).
+/// `None` when any word cannot be found in order.
+///
+/// Decoder-native words are verbatim slices of the text, but forced-aligner
+/// words are the aligner's cleaned tokens (`clean_token`: letters, numbers and
+/// ASCII `'` only), so "peut-être" comes back as "peutêtre" and "U.S." as
+/// "US". Matching therefore skips intra-word separators in the text (see
+/// [`find_word_from`]); a word that still cannot be found is a real mismatch
+/// and the caller fails closed.
 fn locate_words_in_text(text: &str, words: &[WordTimestamp]) -> Option<Vec<usize>> {
     locate_word_starts(text, words.iter().map(|word| word.word.as_str()))
 }
@@ -318,11 +324,55 @@ fn locate_word_starts<'a>(text: &str, words: impl Iterator<Item = &'a str>) -> O
             starts.push(cursor);
             continue;
         }
-        let found = text.get(cursor..)?.find(needle)?;
-        starts.push(cursor + found);
-        cursor = cursor + found + needle.len();
+        let (start, end) = find_word_from(text, cursor, needle)?;
+        starts.push(start);
+        cursor = end;
     }
     Some(starts)
+}
+
+/// First match of `needle` in `text` at or after byte `from`, as a byte range.
+///
+/// A match starts on a character equal to the needle's first character; past
+/// that, text characters that are neither alphanumeric, ASCII `'` nor
+/// whitespace (hyphens, dots, typographic apostrophes...) may be skipped
+/// between needle characters. Whitespace is never skipped, so a word cannot
+/// span two words of the text. With nothing skipped this is an exact `find`,
+/// which keeps decoder-native words (punctuation included) unchanged.
+fn find_word_from(text: &str, from: usize, needle: &str) -> Option<(usize, usize)> {
+    let haystack = text.get(from..)?;
+    let first = needle.chars().next()?;
+    for (offset, ch) in haystack.char_indices() {
+        if ch != first {
+            continue;
+        }
+        if let Some(len) = match_skipping_separators(&haystack[offset..], needle) {
+            let start = from + offset;
+            return Some((start, start + len));
+        }
+    }
+    None
+}
+
+/// Byte length of the prefix of `text` that matches `needle` once intra-word
+/// separators are skipped, or `None` when it does not match.
+fn match_skipping_separators(text: &str, needle: &str) -> Option<usize> {
+    let mut expected = needle.chars().peekable();
+    let mut end = 0usize;
+    for (offset, ch) in text.char_indices() {
+        let Some(&want) = expected.peek() else {
+            break;
+        };
+        if ch == want {
+            expected.next();
+            end = offset + ch.len_utf8();
+        } else if !(ch.is_alphanumeric() || ch == '\'' || ch.is_whitespace()) {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    expected.peek().is_none().then_some(end)
 }
 
 /// Word-snapped tail split of a finalized realtime transcript at an acoustic
@@ -1060,6 +1110,100 @@ mod tests {
         assert_eq!(
             split_transcript_tail_at_change("具体的过程。那现在。", &words, 26_600, 3_000),
             None
+        );
+    }
+
+    /// Words as the forced aligner returns them: `clean_token` drops every
+    /// character but letters, numbers and ASCII `'`.
+    fn aligner_words(tokens: &[&str], start: f32, step: f32) -> Vec<WordTimestamp> {
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| {
+                let word_start = start + step * index as f32;
+                word(token, word_start, word_start + step * 0.8)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aligner_words_without_internal_hyphen_split_against_punctuated_text() {
+        let text = "alors le module il est peut-être pas idéal, il y a peut-être des choses";
+        let mut words = aligner_words(
+            &[
+                "alors",
+                "le",
+                "module",
+                "il",
+                "est",
+                "peutêtre",
+                "pas",
+                "idéal",
+            ],
+            0.0,
+            0.5,
+        );
+        words.extend(aligner_words(
+            &["il", "y", "a", "peutêtre", "des", "choses"],
+            4.0,
+            0.5,
+        ));
+        let turns = vec![turn(0.0, 4.0, 0), turn(4.0, 7.0, 1)];
+        let segs = assign(
+            &turns,
+            vec![worded_seg(0.0, 7.0, text, words)],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].speaker.as_deref(), Some("SPEAKER_00"));
+        assert_eq!(segs[0].text, "alors le module il est peut-être pas idéal,");
+        assert_eq!(segs[0].words.len(), 8);
+        assert_eq!(segs[1].speaker.as_deref(), Some("SPEAKER_01"));
+        assert_eq!(segs[1].text, "il y a peut-être des choses");
+        assert_eq!(segs[1].words.len(), 6);
+        let rejoined = segs
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rejoined, text);
+    }
+
+    #[test]
+    fn aligner_words_match_typographic_apostrophe_and_dotted_acronyms() {
+        let text = "aujourd\u{2019}hui we fly to the U.S. tomorrow";
+        let mut words = aligner_words(&["aujourdhui", "we", "fly"], 0.0, 0.5);
+        words.extend(aligner_words(&["to", "the", "US", "tomorrow"], 2.0, 0.5));
+        let turns = vec![turn(0.0, 2.0, 0), turn(2.0, 4.0, 1)];
+        let segs = assign(
+            &turns,
+            vec![worded_seg(0.0, 4.0, text, words)],
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0].text, "aujourd\u{2019}hui we fly");
+        assert_eq!(segs[1].text, "to the U.S. tomorrow");
+    }
+
+    #[test]
+    fn locate_word_starts_never_skips_whitespace() {
+        // A cleaned token never spans two words of the text: a genuine
+        // mismatch still fails closed.
+        assert_eq!(
+            locate_word_starts("peut être", ["peutêtre"].into_iter()),
+            None
+        );
+    }
+
+    #[test]
+    fn locate_word_starts_advances_cursor_past_skipped_punctuation() {
+        let text = "peut-être peut-être";
+        let second = text.rfind("peut").expect("second occurrence");
+        assert_eq!(
+            locate_word_starts(text, ["peutêtre", "peutêtre"].into_iter()),
+            Some(vec![0, second])
         );
     }
 }
